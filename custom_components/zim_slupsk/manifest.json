@@ -1,0 +1,12 @@
+{
+  "domain": "zim_slupsk",
+  "name": "ZIM Słupsk",
+  "version": "0.1",
+  "documentation": "",
+  "dependencies": [],
+  "codeowners": ["daniel@filipczak.net"],
+  "requirements": ["gtfslib", "requests","beautifulsoup4","aiofiles"],
+  "iot_class": "cloud_polling",
+  "supported_domains": ["sensor", "calendar"],
+  "config_flow": true
+}

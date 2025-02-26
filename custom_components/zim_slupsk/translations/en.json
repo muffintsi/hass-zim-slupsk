@@ -1,0 +1,33 @@
+{
+  "title": "ZIM Słupsk",
+  "config": {
+    "step": {
+      "user": {
+        "title": "Zarząd Infrastruktury Miejskiej w Słupsku",
+        "description": "Select the stop you want to track",
+		"data": {
+          "stop_id": "stop"
+        }
+      }
+    },
+    "error": {
+      "stops_data_unavailable": "No stops available to choose from",
+      "error_downloading_gtfs": "Error downloading GTFS data",
+      "error_loading_gtfs": "Error loading GTFS data"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "ZIM Slupsk Options",
+        "description": "Set additional options for the ZIM Slupsk integration"
+      }
+    }
+  },
+  "system_health": {
+    "info": {
+      "integration_version": "Integration version"
+    }
+  }
+}
+
