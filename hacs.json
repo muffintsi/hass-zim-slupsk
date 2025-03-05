@@ -1,0 +1,14 @@
+{
+  "name": "ZIM Słupsk",
+  "description": "Integration with ZIM Słupsk. The institution responsible for organizing public transportation and timetables in the city of Słupsk.",
+  "country": "PL",
+  "content_in_root": false,
+  "category": "integration",
+  "maintainers": ["muffintsi"],
+  "domains": ["zim_slupsk"],
+  "requirements": [],
+  "dependencies": [],
+  "homeassistant": "2024.12.01",
+  "render_readme": true,
+  "zip_release": false
+}
