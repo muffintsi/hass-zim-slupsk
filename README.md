@@ -1,6 +1,6 @@
 Integracja z ZIM Słupsk. Instytucją odpowiedzialną za organizację transportu miejskiego i rozkład jazdy w mieście Słupsk.
 
-Pozwala na obsługę w Hhome Assistant rozkładu jazdy komunikacji miejskiej miasta Słupsk.
+Pozwala na obsługę w Home Assistant rozkładu jazdy komunikacji miejskiej miasta Słupsk.
 
 - obsługa wielu przystankow
 - automatyczna aktualizacja pliku danych z serwera ZIM Słupsk (wykrywanie zmiany na serwerze)
