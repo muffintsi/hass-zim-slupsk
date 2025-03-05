@@ -1,3 +1,5 @@
+[![Open your Home Assistant instance and start setting up a new integration.](https://my.home-assistant.io/badges/config_flow_start.svg)](https://my.home-assistant.io/redirect/config_flow_start/?domain=zim_slupsk)
+
 Integracja z ZIM Słupsk. Instytucją odpowiedzialną za organizację transportu miejskiego i rozkład jazdy w mieście Słupsk.
 
 Pozwala na obsługę w Home Assistant rozkładu jazdy komunikacji miejskiej miasta Słupsk.
