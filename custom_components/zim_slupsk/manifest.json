@@ -4,7 +4,7 @@
   "version": "0.1",
   "documentation": "",
   "dependencies": [],
-  "codeowners": ["daniel@filipczak.net"],
+  "codeowners": ["muffintsi"],
   "requirements": ["gtfslib", "requests","beautifulsoup4","aiofiles"],
   "iot_class": "cloud_polling",
   "supported_domains": ["sensor", "calendar"],
