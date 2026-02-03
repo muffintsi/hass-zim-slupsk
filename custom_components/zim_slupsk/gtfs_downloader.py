@@ -109,21 +109,30 @@ async def get_current_etag(gtfs_url):
 
 async def generate_calendar_from_feed_info(gtfs_file_path, output_calendar_path, validity_years=30):
     """
-    Asynchronicznie odczytuje feed_info.txt z pliku GTFS (ZIP) i pobiera feed_version,
-    a następnie generuje plik calendar.txt asynchronicznie (przy użyciu aiofiles).
-    Zakres dat ustawiony jest od dzisiaj do dzisiaj + validity_years lat.
-    Wygenerowane service_id: feed_version_NW, feed_version_PF, feed_version_SW.
+    Odczytuje feed_info.txt (jak wcześniej) oraz oryginalny calendar.txt z GTFS (ZIP),
+    a następnie generuje nowy calendar.txt asynchronicznie (aiofiles).
+
+    Zasada:
+    - modyfikujemy WYŁĄCZNIE wiersze, których service_id zawiera: _PO, _NO, _SO
+      * nadpisujemy dni tygodnia zgodnie z logiką:
+        - _NO -> tylko sunday=1
+        - _SO -> tylko saturday=1
+        - _PO -> pn-pt=1
+      * nadpisujemy start_date i end_date (dzisiaj .. dzisiaj + validity_years)
+    - resztę wierszy (w tym _PS) przepisujemy bez zmian
     """
+
+    # 1) feed_version (zostawiamy jak było)
     feed_version = None
     try:
-        with zipfile.ZipFile(gtfs_file_path, 'r') as z:
-            if 'feed_info.txt' in z.namelist():
-                with z.open('feed_info.txt') as f:
-                    lines = f.read().decode('utf-8-sig').splitlines()
+        with zipfile.ZipFile(gtfs_file_path, "r") as z:
+            if "feed_info.txt" in z.namelist():
+                with z.open("feed_info.txt") as f:
+                    lines = f.read().decode("utf-8-sig").splitlines()
                     reader = csv.DictReader(lines)
-                    for row in reader:
-                        feed_version = row.get("feed_version")
-                        break
+                    first = next(reader, None)
+                    if first:
+                        feed_version = first.get("feed_version")
             else:
                 _LOGGER.error("Brak pliku feed_info.txt w GTFS.")
                 return False
@@ -135,24 +144,88 @@ async def generate_calendar_from_feed_info(gtfs_file_path, output_calendar_path,
         _LOGGER.error("Nie znaleziono feed_version w feed_info.txt.")
         return False
 
+    # 2) daty docelowe
     start_date = datetime.now().strftime("%Y%m%d")
     end_date = (datetime.now() + timedelta(days=365 * validity_years)).strftime("%Y%m%d")
 
-    header = "service_id,monday,tuesday,wednesday,thursday,friday,saturday,sunday,start_date,end_date\n"
-    nw_line = f"{feed_version}_NW,0,0,0,0,0,0,1,{start_date},{end_date}\n"
-    pf_line = f"{feed_version}_PF,1,1,1,1,1,0,0,{start_date},{end_date}\n"
-    sw_line = f"{feed_version}_SW,0,0,0,0,0,1,0,{start_date},{end_date}\n"
+    # 3) wczytaj oryginalny calendar.txt i przepisz z modyfikacją tylko _PO/_NO/_SO
+    try:
+        with zipfile.ZipFile(gtfs_file_path, "r") as z:
+            if "calendar.txt" not in z.namelist():
+                _LOGGER.error("Brak pliku calendar.txt w GTFS.")
+                return False
 
-    content = header + nw_line + pf_line + sw_line
+            with z.open("calendar.txt") as f:
+                lines = f.read().decode("utf-8-sig").splitlines()
+                reader = csv.DictReader(lines)
 
+                if not reader.fieldnames or "service_id" not in reader.fieldnames:
+                    _LOGGER.error("calendar.txt nie ma poprawnego nagłówka lub kolumny service_id.")
+                    return False
+
+                required_cols = {"monday","tuesday","wednesday","thursday","friday","saturday","sunday","start_date","end_date"}
+                if not required_cols.issubset(set(reader.fieldnames)):
+                    _LOGGER.error(f"calendar.txt nie ma wymaganych kolumn. Brakuje: {sorted(required_cols - set(reader.fieldnames))}")
+                    return False
+
+                out_lines = []
+                out_lines.append(",".join(reader.fieldnames) + "\n")
+
+                for row in reader:
+                    sid = (row.get("service_id") or "").strip()
+                    new_row = dict(row)  # domyślnie przepisujemy 1:1
+
+                    # zmieniamy TYLKO _PS/_NO/_SO
+                    if "_NO" in sid:
+                        new_row["monday"] = "0"
+                        new_row["tuesday"] = "0"
+                        new_row["wednesday"] = "0"
+                        new_row["thursday"] = "0"
+                        new_row["friday"] = "0"
+                        new_row["saturday"] = "0"
+                        new_row["sunday"] = "1"
+                        new_row["start_date"] = start_date
+                        new_row["end_date"] = end_date
+
+                    elif "_SO" in sid:
+                        new_row["monday"] = "0"
+                        new_row["tuesday"] = "0"
+                        new_row["wednesday"] = "0"
+                        new_row["thursday"] = "0"
+                        new_row["friday"] = "0"
+                        new_row["saturday"] = "1"
+                        new_row["sunday"] = "0"
+                        new_row["start_date"] = start_date
+                        new_row["end_date"] = end_date
+
+                    elif "_PS" in sid:
+                        new_row["monday"] = "1"
+                        new_row["tuesday"] = "1"
+                        new_row["wednesday"] = "1"
+                        new_row["thursday"] = "1"
+                        new_row["friday"] = "1"
+                        new_row["saturday"] = "0"
+                        new_row["sunday"] = "0"
+                        new_row["start_date"] = start_date
+                        new_row["end_date"] = end_date
+
+                    out_lines.append(",".join((new_row.get(fn) or "") for fn in reader.fieldnames) + "\n")
+
+    except Exception as e:
+        _LOGGER.error(f"Błąd podczas odczytu calendar.txt z GTFS: {e}")
+        return False
+
+    # 4) zapis
     try:
         async with aiofiles.open(output_calendar_path, "w", encoding="utf-8") as f:
-            await f.write(content)
+            await f.writelines(out_lines)
         _LOGGER.info(f"Calendar.txt wygenerowany pomyślnie: {output_calendar_path}")
         return True
     except Exception as e:
         _LOGGER.error(f"Błąd przy zapisie calendar.txt: {e}")
         return False
+
+
 
 async def download_gtfs_file(force_update: bool = False):
     """

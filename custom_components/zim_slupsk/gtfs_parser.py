@@ -54,16 +54,41 @@ class GTFSParser:
                     async with aiofiles.open(calendar_path, "r", encoding="utf-8-sig") as f:
                         contents = await f.read()
                     reader = csv.DictReader(contents.splitlines())
-                    self.data["calendar"] = list(reader)
+
+                    # PATCH: normalizacja pól, żeby uniknąć problemów z '\r', spacjami, BOM itp.
+                    normalized_calendar = []
+                    for row in reader:
+                        row["service_id"] = (row.get("service_id") or "").strip()
+                        row["start_date"] = (row.get("start_date") or "").strip()
+                        row["end_date"] = (row.get("end_date") or "").strip()
+                        # dni tygodnia też mogą mieć whitespace
+                        for k in ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"):
+                            if k in row:
+                                row[k] = (row.get(k) or "").strip()
+                        normalized_calendar.append(row)
+
+                    self.data["calendar"] = normalized_calendar
                 else:
                     self.data["calendar"] = []
     
 
                 # Opcjonalnie wczytujemy calendar_dates.txt
-                if 'calendar_dates.txt' in z.namelist():
-                    with z.open('calendar_dates.txt') as f:
+                # MINIMAL PATCH: szukamy też w podfolderach ZIP-a (np. gtfs/calendar_dates.txt)
+                calendar_dates_member = next((name for name in z.namelist() if name.endswith('calendar_dates.txt')), None)
+
+                if calendar_dates_member:
+                    with z.open(calendar_dates_member) as f:
                         reader = csv.DictReader(f.read().decode('utf-8-sig').splitlines())
-                        self.data["calendar_dates"] = list(reader)
+
+                        # PATCH: normalizacja pól, żeby porównania == działały zawsze
+                        normalized_calendar_dates = []
+                        for row in reader:
+                            row["service_id"] = (row.get("service_id") or "").strip()
+                            row["date"] = (row.get("date") or "").strip()
+                            row["exception_type"] = (row.get("exception_type") or "").strip()
+                            normalized_calendar_dates.append(row)
+
+                        self.data["calendar_dates"] = normalized_calendar_dates
                 else:
                     self.data["calendar_dates"] = []
 
@@ -98,40 +123,56 @@ class GTFSParser:
     # ------------------------------
     def service_is_active_on_date(self, service_id, check_date: date) -> bool:
         """
-        Sprawdza, czy dany service_id jest aktywny w dniu check_date, korzystając najpierw z calendar_dates,
-        a jeśli dla tego dnia nie ma wpisu, stosuje fallback do calendar.txt.
+        Zasada:
+        - jeśli calendar_dates ma JAKIKOLWIEK wpis dla tej daty -> calendar_dates jest źródłem prawdy dla całego dnia
+          (nie robimy fallbacku do calendar.txt)
+        - jeśli calendar_dates nie ma żadnych wpisów dla tej daty -> fallback do calendar.txt
         """
         cdate_str = check_date.strftime("%Y%m%d")
-        # Szukamy wpisów w calendar_dates dla danego service_id i sprawdzanej daty
-        cdates = [row for row in self.data["calendar_dates"] 
-                if row.get("service_id") == service_id and row.get("date") == cdate_str]
-        if cdates:
-            # Jeśli znaleziono wpis(e) dla check_date, używamy ich
-            for row in cdates:
-                if row["exception_type"] == "1":
-                    return True
-                elif row["exception_type"] == "2":
-                    return False
-            # W przypadku, gdy wpisy istnieją, ale nie zwracają jednoznacznego True, zwracamy False
+
+        # normalizacja wejścia
+        service_id = (service_id or "").strip()
+
+        # 1) Czy calendar_dates zawiera cokolwiek dla tej daty?
+        any_for_date = any(
+            (row.get("date") or "").strip() == cdate_str
+            for row in self.data.get("calendar_dates", [])
+        )
+
+        # 2) Jeśli tak, to NIE używamy fallbacku do calendar.txt
+        if any_for_date:
+            for row in self.data.get("calendar_dates", []):
+                if (row.get("service_id") or "").strip() == service_id and (row.get("date") or "").strip() == cdate_str:
+                    et = (row.get("exception_type") or "").strip()
+                    if et == "1":
+                        return True
+                    if et == "2":
+                        return False
+            # brak wpisu dla tego service_id w tym dniu => nieaktywny (bez fallbacku)
             return False
-    
-        # Jeśli dla check_date nie znaleziono wpisu w calendar_dates, stosujemy fallback do calendar.txt
-        crows = [c for c in self.data["calendar"] if c.get("service_id") == service_id]
+
+        # 3) Jeśli nie ma żadnych wpisów calendar_dates dla tej daty, stosujemy fallback do calendar.txt
+        crows = [c for c in self.data["calendar"] if (c.get("service_id") or "").strip() == service_id]
         if not crows:
             return False
-    
+
         row = crows[0]  # Przyjmujemy, że dla danego service_id jest tylko jeden wpis
-        start_date = datetime.strptime(row["start_date"], "%Y%m%d").date()
-        end_date = datetime.strptime(row["end_date"], "%Y%m%d").date()
-    
+
+        try:
+            start_date = datetime.strptime((row.get("start_date") or "").strip(), "%Y%m%d").date()
+            end_date = datetime.strptime((row.get("end_date") or "").strip(), "%Y%m%d").date()
+        except Exception as e:
+            _LOGGER.error(f"Niepoprawny start_date/end_date w calendar.txt dla service_id={service_id}: {e}")
+            return False
+
         if not (start_date <= check_date <= end_date):
             _LOGGER.debug(f"Check_date poza zakresem – usługa nie kursuje check_date={check_date}")
             return False
-    
+
         weekday = check_date.weekday()  # 0 = poniedziałek, 6 = niedziela
         mapping = {0: "monday", 1: "tuesday", 2: "wednesday", 3: "thursday", 4: "friday", 5: "saturday", 6: "sunday"}
         day_field = mapping.get(weekday)
-        if row.get(day_field) == "1":
+        if (row.get(day_field) or "").strip() == "1":
             return True
         return False
 
@@ -247,7 +288,7 @@ class GTFSParser:
         now = dt_util.now()
         _LOGGER.debug(f"Generowanie wydarzeń dla linii {line} i przystanku {stop_id} na następne 7 dni.")
 
-        for day_offset in range(7):
+        for day_offset in range(1):
             current_day = today + timedelta(days=day_offset)
             for trip_id, trip in self.data["trips"].items():
                 if trip.get("route_id") != line:
