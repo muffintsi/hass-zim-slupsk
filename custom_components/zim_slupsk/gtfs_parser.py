@@ -288,7 +288,7 @@ class GTFSParser:
         now = dt_util.now()
         _LOGGER.debug(f"Generowanie wydarzeń dla linii {line} i przystanku {stop_id} na następne 7 dni.")
 
-        for day_offset in range(1):
+        for day_offset in range(7):
             current_day = today + timedelta(days=day_offset)
             for trip_id, trip in self.data["trips"].items():
                 if trip.get("route_id") != line:

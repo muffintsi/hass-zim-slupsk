@@ -61,7 +61,7 @@ async def get_gtfs_url():
                 html = await response.text()
                 soup = BeautifulSoup(html, "html.parser")
                 # Szukamy linku z tekstem "tym linkiem"
-                link_tag = soup.find("a", string="tym linkiem")
+                link_tag = soup.find("a", string="Pobierz dane GTFS")
                 if link_tag and 'href' in link_tag.attrs:
                     relative_url = link_tag.attrs['href']
                     full_url = urljoin(GTFS_URL, relative_url)
