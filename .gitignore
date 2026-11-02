@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+custom_components/zim_slupsk/gtfs.zip
+custom_components/zim_slupsk/gtfs.zip.tmp
+custom_components/zim_slupsk/gtfs_metadata.json
+custom_components/zim_slupsk/calendar.txt
+.local-audit/

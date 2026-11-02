@@ -1,68 +1,50 @@
-import logging
-from homeassistant.core import HomeAssistant
-from homeassistant.config_entries import ConfigEntry
+"""ZIM Słupsk integration lifecycle."""
+
+from homeassistant import config_entries
+from homeassistant.const import Platform
 from homeassistant.exceptions import ConfigEntryNotReady
-from .gtfs_parser import GTFSParser
-from .gtfs_downloader import download_gtfs_file
-from .const import DOMAIN
-from .scheduler import schedule_daily_random_update
 
-_LOGGER = logging.getLogger(__name__)
-# DOMAIN jest importowany z const.py
+from .coordinator import DepartureCoordinator, configured_stop, get_store
 
-async def async_setup(hass: HomeAssistant, config: dict):
-    """Inicjalizuje integrację zim_slupsk."""
-    _LOGGER.info("✅ Inicjalizowanie integracji zim_slupsk")
-    gtfs_parser = GTFSParser()
-    hass.data[DOMAIN] = gtfs_parser
+PLATFORMS = (Platform.SENSOR, Platform.CALENDAR)
+
+
+async def async_setup(hass, config):
+    get_store(hass)
     return True
 
-async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
-    """Inicjalizowanie wpisu konfiguracji integracji zim_slupsk."""
-    _LOGGER.info(f"✅ Inicjalizowanie wpisu konfiguracji dla {entry.title}")
 
-    parser = hass.data[DOMAIN]
-    success, gtfs_url = await download_gtfs_file()
+async def _async_options_updated(hass, entry):
+    await hass.config_entries.async_reload(entry.entry_id)
 
-    if success:
-        _LOGGER.info(f"📥 Plik GTFS został pobrany pomyślnie: {gtfs_url if gtfs_url else 'Używany lokalny plik'}")
-        if await parser.load_data():
-            _LOGGER.info("📂 Dane z plików GTFS zostały wczytane.")
-        else:
-            _LOGGER.error("❌ Błąd wczytywania danych z plików GTFS.")
-            raise ConfigEntryNotReady
-    else:
-        _LOGGER.error("❌ Błąd pobierania pliku GTFS.")
-        raise ConfigEntryNotReady
 
-    hass.data[DOMAIN] = parser
-
-    await hass.config_entries.async_forward_entry_setups(entry, ["sensor", "calendar"])
-
-    # Ustawiamy scheduler dla tego wpisu na podstawie entry.entry_id.
-    scheduler_key = f"{DOMAIN}_scheduler_{entry.entry_id}"
-    # Jeśli dla tego entry istnieje już scheduler, anulujemy go.
-    if scheduler_task := hass.data.get(scheduler_key):
-        scheduler_task.cancel()
-    # Uruchamiamy scheduler dopiero po zdarzeniu "homeassistant_started"
-    async def start_scheduler(event):
-        task = hass.async_create_task(schedule_daily_random_update(hass))
-        hass.data[scheduler_key] = task
-        _LOGGER.info(f"Scheduler uruchomiony dla entry {entry.entry_id}")
-    hass.bus.async_listen_once("homeassistant_started", start_scheduler)
-
+async def async_setup_entry(hass, entry):
+    store = get_store(hass)
+    await store.async_refresh()
+    if configured_stop(entry) not in store.parser.get_stops():
+        raise ConfigEntryNotReady("Configured stop is missing from GTFS")
+    coordinator = DepartureCoordinator(hass, entry, store)
+    await coordinator.async_config_entry_first_refresh()
+    entry.runtime_data = coordinator
+    store.entries[entry.entry_id] = coordinator
+    try:
+        await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+    except Exception:
+        await coordinator.async_shutdown()
+        store.entries.pop(entry.entry_id, None)
+        raise
+    # Current HA owns automatic options reloads; old releases need a listener.
+    if not hasattr(config_entries, "OptionsFlowWithReload"):
+        entry.async_on_unload(entry.add_update_listener(_async_options_updated))
     return True
 
-async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry):
-    """Usuwa integrację."""
-    _LOGGER.info(f"🛑 Usuwanie integracji {entry.title}")
-    unload_ok_sensor = await hass.config_entries.async_forward_entry_unload(entry, "sensor")
-    unload_ok_calendar = await hass.config_entries.async_forward_entry_unload(entry, "calendar")
-    scheduler_key = f"{DOMAIN}_scheduler_{entry.entry_id}"
-    scheduler_task = hass.data.get(scheduler_key)
-    if scheduler_task:
-        scheduler_task.cancel()
-        _LOGGER.info(f"Scheduler anulowany dla entry {entry.entry_id}")
-    if unload_ok_sensor and unload_ok_calendar:
-        return True
-    return False
+
+async def async_unload_entry(hass, entry):
+    if not await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
+        return False
+    coordinator = entry.runtime_data
+    await coordinator.async_shutdown()
+    coordinator.store.entries.pop(entry.entry_id, None)
+    entry.runtime_data = None
+    # Retain one bounded feed/cache for UI and reload; no task or timer survives.
+    return True

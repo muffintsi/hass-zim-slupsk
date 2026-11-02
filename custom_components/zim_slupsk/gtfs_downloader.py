@@ -1,305 +1,168 @@
-import os
-import aiohttp
-import aiofiles
-import logging
-from bs4 import BeautifulSoup
-from urllib.parse import urljoin
-from datetime import datetime, timedelta
+"""Bounded conditional downloads through HA's shared HTTP session."""
+
+import asyncio
 import json
-import zipfile
-import csv
-from .const import GTFS_URL, GTFS_FILE_PATH
+import logging
+import os
+from html.parser import HTMLParser
+from pathlib import Path
+from time import monotonic, time
+from urllib.parse import urljoin, urlparse
+
+import aiohttp
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
+
+from .const import GTFS_URL
+from .gtfs_parser import GTFSParser, async_executor_job
 
 _LOGGER = logging.getLogger(__name__)
-METADATA_FILE = os.path.join(os.path.dirname(__file__), "gtfs_metadata.json")
+_TIMEOUT = aiohttp.ClientTimeout(total=60, connect=10, sock_read=30)
+_MAX_DOWNLOAD = 32 * 1024 * 1024
 
-async def async_load_metadata():
-    """Asynchronicznie wczytuje metadane (np. ETag) z pliku JSON."""
-    if os.path.exists(METADATA_FILE):
+
+class _Links(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.links = []
+        self.href = None
+        self.label = ""
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "a":
+            self.href = dict(attrs).get("href")
+            self.label = ""
+
+    def handle_data(self, data):
+        if self.href:
+            self.label += data
+
+    def handle_endtag(self, tag):
+        if tag == "a" and self.href:
+            self.links.append((self.href, self.label.strip()))
+            self.href = None
+
+
+def _find_url(html):
+    parser = _Links()
+    parser.feed(html)
+    links = sorted(
+        parser.links,
+        key=lambda item: not (item[1].casefold() == "tym linkiem" or "gtfs" in item[1].casefold()),
+    )
+    for href, label in links:
+        if label.casefold() == "tym linkiem" or urlparse(href).path.lower().endswith(".zip"):
+            url = urljoin(GTFS_URL, href)
+            if urlparse(url).scheme in ("http", "https"):
+                return url
+    raise ValueError("No GTFS download link found")
+
+
+def _read_metadata(path):
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _commit(path, payload, metadata):
+    """Validate before replacing the working copy; never extract archive paths."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_suffix(".zip.tmp")
+    try:
+        temp.write_bytes(payload)
+        if not GTFSParser(str(temp))._load_data():
+            raise ValueError("Downloaded GTFS is invalid")
+        os.replace(temp, path)
+        meta = path.with_name("gtfs_metadata.json")
+        temp_meta = meta.with_suffix(".json.tmp")
         try:
-            async with aiofiles.open(METADATA_FILE, "r", encoding="utf-8") as f:
-                contents = await f.read()
-            return json.loads(contents)
-        except Exception as e:
-            _LOGGER.error(f"Nie udało się wczytać metadanych: {e}")
-    return {}
+            temp_meta.write_text(json.dumps(metadata), encoding="utf-8")
+            os.replace(temp_meta, meta)
+        except OSError:
+            _LOGGER.warning("GTFS saved, but metadata could not be written", exc_info=True)
+        finally:
+            temp_meta.unlink(missing_ok=True)
+    finally:
+        temp.unlink(missing_ok=True)
 
-async def async_save_metadata(metadata):
-    """Asynchronicznie zapisuje metadane do pliku JSON."""
-    try:
-        async with aiofiles.open(METADATA_FILE, "w", encoding="utf-8") as f:
-            await f.write(json.dumps(metadata))
-    except Exception as e:
-        _LOGGER.error(f"Nie udało się zapisać metadanych: {e}")
 
-async def get_gtfs_url():
-    """
-    Scrapuje stronę i pobiera aktualny URL do pliku GTFS.
-    """
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:134.0) Gecko/20100101 Firefox/134.0",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "pl,en-US;q=0.7,en;q=0.3",
-        "Accept-Encoding": "gzip, deflate, br",
-        "DNT": "1",
-        "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1",
-        "Referer": "https://zimslupsk.pl",
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "same-origin",
-        "Sec-Fetch-User": "?1"
-     }
+class GTFSDownloader:
+    """A single instance per HA, serialized by the feed store."""
 
-    async with aiohttp.ClientSession() as session:
+    def __init__(self, hass, path):
+        self.hass = hass
+        self.path = Path(path)
+        self.http_requests = 0
+        self.next_check = 0.0
+
+    async def _read_response(self, response, limit):
+        payload = bytearray()
+        async for chunk in response.content.iter_chunked(65536):
+            payload.extend(chunk)
+            if len(payload) > limit:
+                raise ValueError("GTFS HTTP response exceeds size limit")
+        return bytes(payload)
+
+    async def async_download(self, force_update=False):
+        exists = await self.hass.async_add_executor_job(self.path.is_file)
+        if not force_update and monotonic() < self.next_check:
+            return exists, False
+        session = async_get_clientsession(self.hass)
+        before = self.http_requests
         try:
-            async with session.get(GTFS_URL, headers=headers) as response:
-                if response.status != 200:
-                    _LOGGER.error(f"Nie udało się pobrać strony. Status HTTP: {response.status}")
-                    return None
-
-                html = await response.text()
-                soup = BeautifulSoup(html, "html.parser")
-                # Szukamy linku z tekstem "tym linkiem"
-                link_tag = soup.find("a", string="Pobierz dane GTFS")
-                if link_tag and 'href' in link_tag.attrs:
-                    relative_url = link_tag.attrs['href']
-                    full_url = urljoin(GTFS_URL, relative_url)
-                    _LOGGER.info(f"Znaleziono URL pliku GTFS: {full_url}")
-                    return full_url
-                else:
-                    _LOGGER.error("Nie udało się znaleźć linku do pliku GTFS.")
-                    return None
-        except Exception as e:
-            _LOGGER.error(f"Problem z pobraniem strony: {e}")
-            return None
-
-async def get_current_etag(gtfs_url):
-    """
-    Wykonuje żądanie HEAD do podanego URL-a i zwraca wartość nagłówka ETag.
-    """
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:134.0) Gecko/20100101 Firefox/134.0",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "pl,en-US;q=0.7,en;q=0.3",
-        "Accept-Encoding": "gzip, deflate, br",
-        "DNT": "1",
-        "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1",
-        "Referer": "https://zimslupsk.pl/otwarte-dane.html",
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "same-origin",
-        "Sec-Fetch-User": "?1",
-        "Host": "zimslupsk.pl"
-    }
-    async with aiohttp.ClientSession() as session:
-        try:
-            async with session.head(gtfs_url, headers=headers) as response:
-                if response.status == 200:
-                    etag = response.headers.get("ETag")
-                    _LOGGER.debug(f"Uzyskano ETag z serwera: {etag}")
-                    return etag
-                else:
-                    _LOGGER.error(f"Żądanie HEAD nie powiodło się. Status: {response.status}")
-                    return None
-        except Exception as e:
-            _LOGGER.error(f"Błąd podczas żądania HEAD: {e}")
-            return None
-
-async def generate_calendar_from_feed_info(gtfs_file_path, output_calendar_path, validity_years=30):
-    """
-    Odczytuje feed_info.txt (jak wcześniej) oraz oryginalny calendar.txt z GTFS (ZIP),
-    a następnie generuje nowy calendar.txt asynchronicznie (aiofiles).
-
-    Zasada:
-    - modyfikujemy WYŁĄCZNIE wiersze, których service_id zawiera: _PO, _NO, _SO
-      * nadpisujemy dni tygodnia zgodnie z logiką:
-        - _NO -> tylko sunday=1
-        - _SO -> tylko saturday=1
-        - _PO -> pn-pt=1
-      * nadpisujemy start_date i end_date (dzisiaj .. dzisiaj + validity_years)
-    - resztę wierszy (w tym _PS) przepisujemy bez zmian
-    """
-
-    # 1) feed_version (zostawiamy jak było)
-    feed_version = None
-    try:
-        with zipfile.ZipFile(gtfs_file_path, "r") as z:
-            if "feed_info.txt" in z.namelist():
-                with z.open("feed_info.txt") as f:
-                    lines = f.read().decode("utf-8-sig").splitlines()
-                    reader = csv.DictReader(lines)
-                    first = next(reader, None)
-                    if first:
-                        feed_version = first.get("feed_version")
-            else:
-                _LOGGER.error("Brak pliku feed_info.txt w GTFS.")
-                return False
-    except Exception as e:
-        _LOGGER.error(f"Błąd podczas odczytu GTFS: {e}")
-        return False
-
-    if not feed_version:
-        _LOGGER.error("Nie znaleziono feed_version w feed_info.txt.")
-        return False
-
-    # 2) daty docelowe
-    start_date = datetime.now().strftime("%Y%m%d")
-    end_date = (datetime.now() + timedelta(days=365 * validity_years)).strftime("%Y%m%d")
-
-    # 3) wczytaj oryginalny calendar.txt i przepisz z modyfikacją tylko _PO/_NO/_SO
-    try:
-        with zipfile.ZipFile(gtfs_file_path, "r") as z:
-            if "calendar.txt" not in z.namelist():
-                _LOGGER.error("Brak pliku calendar.txt w GTFS.")
-                return False
-
-            with z.open("calendar.txt") as f:
-                lines = f.read().decode("utf-8-sig").splitlines()
-                reader = csv.DictReader(lines)
-
-                if not reader.fieldnames or "service_id" not in reader.fieldnames:
-                    _LOGGER.error("calendar.txt nie ma poprawnego nagłówka lub kolumny service_id.")
-                    return False
-
-                required_cols = {"monday","tuesday","wednesday","thursday","friday","saturday","sunday","start_date","end_date"}
-                if not required_cols.issubset(set(reader.fieldnames)):
-                    _LOGGER.error(f"calendar.txt nie ma wymaganych kolumn. Brakuje: {sorted(required_cols - set(reader.fieldnames))}")
-                    return False
-
-                out_lines = []
-                out_lines.append(",".join(reader.fieldnames) + "\n")
-
-                for row in reader:
-                    sid = (row.get("service_id") or "").strip()
-                    new_row = dict(row)  # domyślnie przepisujemy 1:1
-
-                    # zmieniamy TYLKO _PS/_NO/_SO
-                    if "_NO" in sid:
-                        new_row["monday"] = "0"
-                        new_row["tuesday"] = "0"
-                        new_row["wednesday"] = "0"
-                        new_row["thursday"] = "0"
-                        new_row["friday"] = "0"
-                        new_row["saturday"] = "0"
-                        new_row["sunday"] = "1"
-                        new_row["start_date"] = start_date
-                        new_row["end_date"] = end_date
-
-                    elif "_SO" in sid:
-                        new_row["monday"] = "0"
-                        new_row["tuesday"] = "0"
-                        new_row["wednesday"] = "0"
-                        new_row["thursday"] = "0"
-                        new_row["friday"] = "0"
-                        new_row["saturday"] = "1"
-                        new_row["sunday"] = "0"
-                        new_row["start_date"] = start_date
-                        new_row["end_date"] = end_date
-
-                    elif "_PS" in sid:
-                        new_row["monday"] = "1"
-                        new_row["tuesday"] = "1"
-                        new_row["wednesday"] = "1"
-                        new_row["thursday"] = "1"
-                        new_row["friday"] = "1"
-                        new_row["saturday"] = "0"
-                        new_row["sunday"] = "0"
-                        new_row["start_date"] = start_date
-                        new_row["end_date"] = end_date
-
-                    out_lines.append(",".join((new_row.get(fn) or "") for fn in reader.fieldnames) + "\n")
-
-    except Exception as e:
-        _LOGGER.error(f"Błąd podczas odczytu calendar.txt z GTFS: {e}")
-        return False
-
-    # 4) zapis
-    try:
-        async with aiofiles.open(output_calendar_path, "w", encoding="utf-8") as f:
-            await f.writelines(out_lines)
-        _LOGGER.info(f"Calendar.txt wygenerowany pomyślnie: {output_calendar_path}")
-        return True
-    except Exception as e:
-        _LOGGER.error(f"Błąd przy zapisie calendar.txt: {e}")
-        return False
-
-
-
-async def download_gtfs_file(force_update: bool = False):
-    """
-    Pobiera plik GTFS z dynamicznego URL i zapisuje go lokalnie.
-    Jeśli force_update jest False, sprawdza, czy lokalny plik istnieje.
-      - Jeżeli plik istnieje i jest młodszy niż 24 godziny, zwraca (True, None).
-      - Jeżeli plik istnieje, ale jest starszy niż 24h, pobiera URL, sprawdza ETag
-        i jeżeli ETag się zgadzają, zwraca (True, None); w przeciwnym razie pobiera nową wersję.
-    Po pomyślnym pobraniu (lub użyciu lokalnej kopii) sprawdza, czy plik calendar.txt istnieje.
-    Jeśli nie – generuje go przy użyciu generate_calendar_from_feed_info().
-    Zwraca krotkę: (True, URL) jeśli pobieranie się powiodło, (True, None) gdy używamy lokalnej kopii,
-    lub (False, None) w razie błędu.
-    """
-    # Sprawdzamy lokalny plik GTFS
-    if not force_update and os.path.exists(GTFS_FILE_PATH):
-        mod_time = os.path.getmtime(GTFS_FILE_PATH)
-        mod_datetime = datetime.fromtimestamp(mod_time)
-        if datetime.now() - mod_datetime < timedelta(days=1):
-            _LOGGER.info("Lokalna kopia pliku GTFS jest młodsza niż 24 godziny – używamy jej.")
-            # Sprawdzamy, czy plik calendar.txt istnieje; jeśli nie, generujemy go.
-            calendar_txt_path = os.path.join(os.path.dirname(GTFS_FILE_PATH), "calendar.txt")
-            if not os.path.exists(calendar_txt_path):
-                _LOGGER.warning("Plik calendar.txt nie istnieje – generuję go.")
-                await generate_calendar_from_feed_info(GTFS_FILE_PATH, calendar_txt_path)
-            return True, None
-        else:
-            # Plik jest starszy niż 24h – pobieramy URL i sprawdzamy ETag
-            gtfs_url = await get_gtfs_url()
-            if gtfs_url:
-                current_etag = await get_current_etag(gtfs_url)
-                metadata = await async_load_metadata()
-                saved_etag = metadata.get("etag")
-                if current_etag and saved_etag == current_etag:
-                    _LOGGER.info("Lokalna kopia pliku GTFS, mimo że starsza niż 24h, jest aktualna (ETag się zgadza).")
-                    return True, None
-                else:
-                    _LOGGER.info("Plik starszy niż 24h i ETag się różni – aktualizujemy plik.")
-            else:
-                _LOGGER.error("Brak URL do pliku GTFS podczas sprawdzania ETag.")
-
-    # Pobieranie pliku – uzyskujemy URL (jeśli nie został wcześniej pobrany)
-    gtfs_url = gtfs_url if 'gtfs_url' in locals() and gtfs_url else await get_gtfs_url()
-    if gtfs_url:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(gtfs_url) as response:
-                if response.status == 200:
-                    os.makedirs(os.path.dirname(GTFS_FILE_PATH), exist_ok=True)
-                    async with aiofiles.open(GTFS_FILE_PATH, "wb") as file:
-                        await file.write(await response.read())
-                    new_etag = response.headers.get("ETag")
-                    metadata = await async_load_metadata()
-                    if new_etag:
-                        metadata["etag"] = new_etag
-                        await async_save_metadata(metadata)
-                    _LOGGER.info(f"Pobrano plik GTFS z adresu: {gtfs_url}")
-                    # Po pobraniu pliku GTFS generujemy plik calendar.txt
-                    output_calendar_path = os.path.join(os.path.dirname(GTFS_FILE_PATH), "calendar.txt")
-                    gen_ok = await generate_calendar_from_feed_info(GTFS_FILE_PATH, output_calendar_path)
-                    if not gen_ok:
-                        _LOGGER.error("Nie udało się wygenerować pliku calendar.txt.")
-                    return True, gtfs_url
-                else:
-                    _LOGGER.error(f"Błąd podczas pobierania pliku GTFS z {gtfs_url}, status: {response.status}")
-    else:
-        _LOGGER.error("Brak URL do pliku GTFS, pobieranie nie powiodło się.")
-
-    if os.path.exists(GTFS_FILE_PATH):
-        _LOGGER.warning("Nie udało się pobrać nowej wersji pliku GTFS, ale lokalny plik istnieje – używamy go.")
-        # Sprawdzamy też, czy plik calendar.txt istnieje; jeśli nie – generujemy go.
-        calendar_txt_path = os.path.join(os.path.dirname(GTFS_FILE_PATH), "calendar.txt")
-        if not os.path.exists(calendar_txt_path):
-            _LOGGER.warning("Plik calendar.txt nie istnieje – generuję go.")
-            await generate_calendar_from_feed_info(GTFS_FILE_PATH, calendar_txt_path)
-        return True, None
-    else:
-        _LOGGER.error("❌ Brak pliku GTFS – nie można załadować danych!")
-        return False, None
+            metadata = await self.hass.async_add_executor_job(
+                _read_metadata, self.path.with_name("gtfs_metadata.json")
+            )
+            # After restart the file mtime is a safe fallback for old metadata.
+            if exists and not force_update:
+                age = await self.hass.async_add_executor_job(
+                    lambda: time() - self.path.stat().st_mtime
+                )
+                if age < 86400:
+                    self.next_check = monotonic() + max(60, 86400 - age)
+                    return True, False
+            self.http_requests += 1
+            async with session.get(GTFS_URL, timeout=_TIMEOUT) as response:
+                response.raise_for_status()
+                html = (await self._read_response(response, 2 * 1024 * 1024)).decode("utf-8")
+            url = await self.hass.async_add_executor_job(_find_url, html)
+            headers = {}
+            if exists and metadata.get("url") == url:
+                if metadata.get("etag"):
+                    headers["If-None-Match"] = metadata["etag"]
+                if metadata.get("last_modified"):
+                    headers["If-Modified-Since"] = metadata["last_modified"]
+            self.http_requests += 1
+            async with session.get(url, headers=headers, timeout=_TIMEOUT) as response:
+                if response.status == 304 and exists:
+                    await self.hass.async_add_executor_job(self.path.touch)
+                    self.next_check = monotonic() + 86400
+                    return True, False
+                response.raise_for_status()
+                payload = await self._read_response(response, _MAX_DOWNLOAD)
+                metadata = {
+                    **metadata,
+                    "url": url,
+                    "etag": response.headers.get("ETag"),
+                    "last_modified": response.headers.get("Last-Modified"),
+                }
+            await async_executor_job(self.hass, _commit, self.path, payload, metadata)
+            self.next_check = monotonic() + 86400
+            return True, True
+        except (
+            aiohttp.ClientError,
+            TimeoutError,
+            asyncio.TimeoutError,
+            OSError,
+            ValueError,
+        ) as err:
+            self.next_check = monotonic() + 3600
+            _LOGGER.warning("GTFS update failed; local copy available=%s: %s", exists, err)
+            return exists, False
+        finally:
+            _LOGGER.debug(
+                "GTFS refresh HTTP requests=%d total=%d",
+                self.http_requests - before,
+                self.http_requests,
+            )

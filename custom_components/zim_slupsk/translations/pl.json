@@ -3,30 +3,60 @@
   "config": {
     "step": {
       "user": {
-        "title": "Zarząd Infrastruktury Miejskiej w Słupsku",
-        "description": "Wybierz przystanek, dla którego chcesz pobierać dane",
-		"data": {
-          "stop_id": "przystanek"
+        "title": "ZIM Słupsk",
+        "description": "Wybierz przystanek.",
+        "data": {
+          "stop_id": "Przystanek"
+        }
+      },
+      "reconfigure": {
+        "title": "ZIM Słupsk",
+        "description": "Wybierz przystanek.",
+        "data": {
+          "stop_id": "Przystanek"
         }
       }
     },
     "error": {
-      "stops_data_unavailable": "Brak dostępnych przystanków do wyboru",
-      "error_downloading_gtfs": "Błąd podczas pobierania danych GTFS",
-      "error_loading_gtfs": "Błąd podczas ładowania danych GTFS"
+      "cannot_connect": "Nie można wczytać danych GTFS. Spróbuj ponownie.",
+      "invalid_stop": "Wybierz przystanek z listy.",
+      "already_configured": "Ten przystanek jest już skonfigurowany.",
+      "stops_data_unavailable": "Brak dostępnych przystanków.",
+      "error_downloading_gtfs": "Błąd pobierania GTFS.",
+      "error_loading_gtfs": "Błąd odczytu GTFS."
+    },
+    "abort": {
+      "cannot_connect": "Nie można wczytać danych GTFS. Spróbuj ponownie.",
+      "invalid_stop": "Wybierz przystanek z listy.",
+      "already_configured": "Ten przystanek jest już skonfigurowany.",
+      "stops_data_unavailable": "Brak dostępnych przystanków.",
+      "error_downloading_gtfs": "Błąd pobierania GTFS.",
+      "error_loading_gtfs": "Błąd odczytu GTFS.",
+      "reconfigure_successful": "Zapisano konfigurację."
     }
   },
   "options": {
     "step": {
       "init": {
-        "title": "Opcje ZIM Słupsk",
-        "description": "Ustaw dodatkowe opcje integracji ZIM Słupsk"
+        "title": "ZIM Słupsk",
+        "description": "Wybierz przystanek.",
+        "data": {
+          "stop_id": "Przystanek",
+          "calendar_days": "Liczba dni w kalendarzu"
+        },
+        "data_description": {
+          "calendar_days": "Od 1 do 60 dni, licząc od dzisiaj w strefie przewoźnika. Domyślnie 7. Ustawienie nie zmienia częstotliwości pobierania GTFS ani sensorów odjazdów."
+        }
       }
-    }
-  },
-  "system_health": {
-    "info": {
-      "integration_version": "Wersja integracji"
+    },
+    "error": {
+      "cannot_connect": "Nie można wczytać danych GTFS. Spróbuj ponownie.",
+      "invalid_stop": "Wybierz przystanek z listy.",
+      "already_configured": "Ten przystanek jest już skonfigurowany.",
+      "stops_data_unavailable": "Brak dostępnych przystanków.",
+      "error_downloading_gtfs": "Błąd pobierania GTFS.",
+      "error_loading_gtfs": "Błąd odczytu GTFS.",
+      "invalid_calendar_days": "Podaj całkowitą liczbę dni od 1 do 60."
     }
   }
 }

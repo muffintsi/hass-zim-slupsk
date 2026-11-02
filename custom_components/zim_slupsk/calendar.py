@@ -1,235 +1,197 @@
-from datetime import datetime, timedelta, date
+"""Calendar entities with range queries independent of entity state updates."""
+
+import asyncio
 import logging
 import re
+from collections import OrderedDict
+from datetime import date, datetime, time, timezone
+from time import perf_counter
 
 from homeassistant.components.calendar import CalendarEntity, CalendarEvent
-from homeassistant.helpers.event import async_track_time_interval
-import homeassistant.util.dt as dt_util
-from .gtfs_parser import GTFSParser
-from .const import DOMAIN
+from homeassistant.core import callback
+from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers.update_coordinator import CoordinatorEntity
+from homeassistant.util import dt as dt_util
 
 _LOGGER = logging.getLogger(__name__)
 
-async def async_setup_entry(hass, entry, async_add_entities):
-    """Setup calendar platform for zim_slupsk."""
-    parser = hass.data[DOMAIN]
-
-    _LOGGER.info("🔄 Rejestracja kalendarzy dla przystanku...")
-
-    # Pobierz przystanek ID z konfiguracji
-    stop_id = entry.data["stop_id"]
-    stop_info = parser.data["stops"].get(stop_id, {})
-    stop_name = stop_info.get("stop_name", "Nieznany")
-    stop_code = stop_info.get("stop_code", "")
-    stop_lat = float(stop_info.get("stop_lat", 0.0))
-    stop_lon = float(stop_info.get("stop_lon", 0.0))
-    stop_code_fragment = stop_code.split("/")[-1] if "/" in stop_code else stop_code
-
-    # Pełna nazwa przystanku
-    stop_full_name = f"{stop_name} {stop_code_fragment}"
-    _LOGGER.debug(f"Przystanek: {stop_full_name}, Latitude: {stop_lat}, Longitude: {stop_lon}")
-
-    # Pobieramy odjazdy dla przystanku asynchronicznie, aby uniknąć blokowania setupu
-    departures_by_line = await hass.async_add_executor_job(parser.get_next_departures, stop_id)
-    if not departures_by_line:
-        _LOGGER.warning(f"⚠️ Brak odjazdów (dla wszystkich linii) na przystanku {stop_full_name}.")
-        return
-
-    calendars = []
-    for line in departures_by_line.keys():
-        entity_id = f"calendar.linia_{line}_{sanitize_name(stop_full_name)}"
-        calendar = CalendarSensor(
-            parser,
-            stop_id,  # Przekazujemy stop_id bezpośrednio
-            stop_full_name,
-            line,
-            entry.entry_id,
-            entity_id,
-            stop_lat,  # Przekazujemy rzeczywiste wartości
-            stop_lon,
-            stop_name,
-            stop_code
-        )
-        calendars.append(calendar)
-
-    if not calendars:
-        _LOGGER.warning(f"⚠️ Nie utworzono kalendarzy dla przystanku {stop_full_name}.")
-        return
-
-    _LOGGER.info(f"✅ Utworzono {len(calendars)} kalendarzy dla przystanku {stop_full_name}.")
-    async_add_entities(calendars, True)
 
 def sanitize_name(name):
-    """Zamienia polskie znaki i spacje na podkreślenia dla entity_id."""
-    name = name.lower()
-    name = name.replace(" ", "_")
-    name = re.sub(r"[^\w\d_]", "", name)  # Usuwamy znaki specjalne
-    return name
+    """Keep existing entity and unique IDs unchanged."""
+    return re.sub(r"[^\w\d_]", "", name.lower().replace(" ", "_"))
 
-def parse_datetime(dt_str):
+
+def _bound(value):
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=dt_util.DEFAULT_TIME_ZONE)
+        return value
+    if isinstance(value, date):
+        return datetime.combine(value, time(), dt_util.DEFAULT_TIME_ZONE)
+    raise ValueError("Expected a date or datetime")
+
+
+def _calendar_event(event):
+    return CalendarEvent(
+        summary=event["title"],
+        start=event["start"],
+        end=event["end"],
+        description=event["description"],
+    )
+
+
+async def async_setup_entry(hass, entry, async_add_entities):
+    coordinator = entry.runtime_data
+    parser = coordinator.store.parser
+    stop_id = coordinator.stop_id
+    stop = parser.get_stops()[stop_id]
+    name = stop.get("stop_name", "Nieznany")
+    code = stop.get("stop_code", "")
+    full_name = f"{name} {code.split('/')[-1]}"
     try:
-        dt = datetime.fromisoformat(dt_str)
-        # Upewnij się, że datetime jest świadomy strefy czasowej
-        if dt.tzinfo is None:
-            dt = dt_util.as_utc(dt)
-        return dt
-    except ValueError as e:
-        _LOGGER.error(f"Niepoprawny format daty: {dt_str} -> {e}")
-        return None
+        lat, lon = float(stop.get("stop_lat") or 0), float(stop.get("stop_lon") or 0)
+    except (TypeError, ValueError):
+        lat = lon = 0.0
+    # Discover all lines, even when none operates today or tomorrow.
+    lines = await hass.async_add_executor_job(parser.get_lines, stop_id)
+    async_add_entities(
+        [
+            CalendarSensor(
+                coordinator,
+                stop_id,
+                full_name,
+                line,
+                entry.entry_id,
+                f"calendar.linia_{line}_{sanitize_name(full_name)}",
+                lat,
+                lon,
+                name,
+                code,
+            )
+            for line in lines
+        ]
+    )
 
-class CalendarSensor(CalendarEntity):
-    """
-    Sensor typu Calendar dla danej linii i przystanku zawierający godziny odjazdów przez 7 dni.
-    """
+
+class CalendarSensor(CoordinatorEntity, CalendarEntity):
+    """A bus line calendar; HA's CalendarEntity supplies the on/off state."""
+
+    _attr_icon = "mdi:calendar"
 
     def __init__(
         self,
-        parser: GTFSParser,
-        stop_id: str,  # Dodano stop_id
-        stop_full_name: str,
-        line: str,
-        entry_id: str,
-        entity_id: str,
-        stop_lat: float,
-        stop_lon: float,
-        stop_name: str,
-        stop_code: str
+        coordinator,
+        stop_id,
+        stop_full_name,
+        line,
+        entry_id,
+        entity_id,
+        stop_lat,
+        stop_lon,
+        stop_name,
+        stop_code,
     ):
-        self._parser = parser
-        self._stop_id = stop_id  # Przechowujemy stop_id
-        self._stop_full_name = stop_full_name
-        self._stop_full_id = sanitize_name(stop_full_name)
+        super().__init__(coordinator)
+        self._parser = coordinator.store.parser
+        self._stop_id = stop_id
         self._line = line
-        self._entry_id = entry_id
         self.entity_id = entity_id
+        self._attr_name = f"Linia {line} - {stop_full_name}"
+        self._attr_unique_id = (
+            f"zim_slupsk_calendar_{line}_{sanitize_name(stop_full_name)}_{entry_id}"
+        )
+        self._attr_extra_state_attributes = {
+            "calendar_days": coordinator.calendar_days,
+            "line": line,
+            "latitude": stop_lat,
+            "longitude": stop_lon,
+            "stop_name": stop_name,
+            "stop_code": stop_code,
+        }
+        self._event = None
+        self._range_cache = OrderedDict()
+        self._query_lock = asyncio.Lock()
+        self._update_event()
 
-        # Atrybuty do wyświetlenia w kalendarzu:
-        self._stop_lat = stop_lat
-        self._stop_lon = stop_lon
-        self._stop_name = stop_name
-        self._stop_code = stop_code
+    def _update_event(self):
+        event = (self.coordinator.data or {}).get("calendar", {}).get(self._line)
+        self._event = _calendar_event(event) if event else None
+        self._attr_extra_state_attributes["event_count"] = (
+            (self.coordinator.data or {}).get("counts", {}).get(self._line, 0)
+        )
 
-        self._events = []
-        # Usunięto wywołanie update_departures() z __init__
-        # Ciężkie operacje będą wykonywane asynchronicznie w async_added_to_hass()
-
-    async def async_added_to_hass(self):
-        """Wykonuje operacje po dodaniu encji do Home Assistant."""
-        _LOGGER.debug(f"Adding {self.name} to hass and setting up update interval.")
-        # Harmonogram aktualizacji co minutę
-        async_track_time_interval(self.hass, self.async_update_event_list, timedelta(minutes=1))
-        # Natychmiastowa aktualizacja w tle
-        self.hass.async_create_task(self.async_update_event_list())
-
-    async def async_update_event_list(self, _now=None):
-        """Aktualizuje listę wydarzeń i odświeża stan encji."""
-        _LOGGER.debug(f"Updating event list for {self.name}.")
-        # Przenosimy synchronizacyjną operację update_departures do osobnego wątku
-        await self.hass.async_add_executor_job(self.update_departures)
-        self.async_write_ha_state()
-
-    @property
-    def name(self):
-        """Nazwa sensora."""
-        return f"Linia {self._line} - {self._stop_full_name}"
-
-    @property
-    def unique_id(self):
-        return f"zim_slupsk_calendar_{self._line}_{self._stop_full_id}_{self._entry_id}"
-
-    @property
-    def icon(self):
-        """Ikona kalendarza (mdi:calendar)."""
-        return "mdi:calendar"
+    @callback
+    def _handle_coordinator_update(self):
+        self._update_event()
+        super()._handle_coordinator_update()
 
     @property
     def event(self):
-        """
-        Bieżące wydarzenie kalendarza.
-        """
-        if self._events:
-            event_data = self._events[0]  # Pierwsze wydarzenie w posortowanej liście
-            _LOGGER.debug(f"Przetwarzanie wydarzenia: {event_data}")  # Dodatkowe logowanie
-            try:
-                event_start = datetime.fromisoformat(event_data["start"])
-                event_end = datetime.fromisoformat(event_data["end"])
-            except ValueError as e:
-                _LOGGER.error(f"Niepoprawny format daty w wydarzeniu: {e}")
-                return None
+        return self._event
 
-            return CalendarEvent(
-                summary=event_data["title"],
-                start=event_start,
-                end=event_end,
-                description=event_data["description"]
+    def _get_events(self, start, end):
+        # Counters and query refer to the same immutable feed generation.
+        with self._parser._lock:
+            hits, misses = self._parser.cache_hits, self._parser.cache_misses
+            events = [
+                _calendar_event(event)
+                for event in self._parser.get_events(self._stop_id, self._line, start, end)
+            ]
+            return (
+                events,
+                self._parser.cache_hits - hits,
+                self._parser.cache_misses - misses,
+                self._parser.generation,
             )
-        return None
 
     async def async_get_events(self, hass, start_date, end_date):
-        """
-        Zwraca listę wydarzeń między start_date a end_date.
-        """
-        _LOGGER.debug(f"Received start_date: {start_date} ({type(start_date)}), end_date: {end_date} ({type(end_date)})")
-
-        # Konwersja start_date i end_date na datetime.date, jeśli są typu datetime.datetime
-        if isinstance(start_date, datetime):
-            start_date = start_date.date()
-        if isinstance(end_date, datetime):
-            end_date = end_date.date()
-
-        events = []
-        for event_data in self._events:
-            try:
-                # Zachowujemy datetime.datetime dla CalendarEvent
-                event_start = datetime.fromisoformat(event_data["start"])
-                event_end = datetime.fromisoformat(event_data["end"])
-            except ValueError as e:
-                _LOGGER.error(f"Niepoprawny format daty w wydarzeniu: {e}")
-                continue
-
-            event_start_date = event_start.date()
-            event_end_date = event_end.date()
-
-            _LOGGER.debug(f"Comparing event_start_date: {event_start_date} with start_date: {start_date} and end_date: {end_date}")
-
-            # Porównanie dat
-            if start_date <= event_start_date <= end_date:
-                event = CalendarEvent(
-                    summary=event_data["title"],
-                    start=event_start,
-                    end=event_end,
-                    description=event_data["description"]
+        started = perf_counter()
+        events, hits, misses = [], 0, 0
+        range_hit = False
+        try:
+            start, end = _bound(start_date), _bound(end_date)
+            window_start, window_end = self._parser.calendar_window(self.coordinator.calendar_days)
+            start = max(start.astimezone(timezone.utc), window_start.astimezone(timezone.utc))
+            end = min(end.astimezone(timezone.utc), window_end.astimezone(timezone.utc))
+            if end <= start:
+                return []
+            async with self._query_lock:
+                key = (
+                    self._parser.generation,
+                    start.astimezone(timezone.utc),
+                    end.astimezone(timezone.utc),
                 )
-                events.append(event)
-        return events
-
-    def update_departures(self):
-        """
-        Aktualizuje listę wydarzeń na następne 7 dni.
-        """
-        self._events = self._parser.get_departures_for_week(self._line, stop_id=self._stop_id)
-        _LOGGER.info(
-            f"📅 Calendar {self.name} (linia {self._line}) -> liczba wydarzeń: {len(self._events)}"
-        )
-        # Usunięto wywołanie async_write_ha_state() tutaj
-
-    @property
-    def extra_state_attributes(self):
-        """Atrybuty dodatkowe dla kalendarza."""
-        return {
-            "line": self._line,
-            "latitude": self._stop_lat,
-            "longitude": self._stop_lon,
-            "stop_name": self._stop_name,
-            "stop_code": self._stop_code,
-            "friendly_name": self.name
-        }
-
-    @property
-    def state(self):
-        """Stan sensora: liczba wydarzeń."""
-        return f"{len(self._events)} wydarzeń"
-
-    def update(self):
-        """HA wywołuje update -> i tak mamy update_departures()"""
-        self.update_departures()
+                if key in self._range_cache:
+                    range_hit = True
+                    self._range_cache.move_to_end(key)
+                    events = self._range_cache[key]
+                else:
+                    events, hits, misses, generation = await hass.async_add_executor_job(
+                        self._get_events, start, end
+                    )
+                    # Old snapshots and oversized combined caches must not accumulate.
+                    self._range_cache = OrderedDict(
+                        (k, v) for k, v in self._range_cache.items() if k[0] == generation
+                    )
+                    self._range_cache[(generation, key[1], key[2])] = events
+                    while (
+                        len(self._range_cache) > 4
+                        or sum(map(len, self._range_cache.values())) > 5000
+                    ):
+                        self._range_cache.popitem(last=False)
+                return list(events)
+        except ValueError as err:
+            raise HomeAssistantError(str(err)) from err
+        finally:
+            _LOGGER.debug(
+                "async_get_events stop=%s line=%s duration=%.4fs events=%d "
+                "cache_hits=%d cache_misses=%d range_cache_hit=%s http_requests=0 http_total=%d",
+                self._stop_id,
+                self._line,
+                perf_counter() - started,
+                len(events),
+                hits,
+                misses,
+                range_hit,
+                self.coordinator.store.downloader.http_requests,
+            )

@@ -1,12 +1,14 @@
 {
   "domain": "zim_slupsk",
   "name": "ZIM Słupsk",
-  "version": "1.1.1",
-  "documentation": "",
+  "codeowners": [
+    "@muffintsi"
+  ],
+  "config_flow": true,
   "dependencies": [],
-  "codeowners": ["muffintsi"],
-  "requirements": ["gtfslib", "requests","beautifulsoup4","aiofiles"],
+  "documentation": "https://github.com/muffintsi/hass-zim-slupsk",
   "iot_class": "cloud_polling",
-  "supported_domains": ["sensor", "calendar"],
-  "config_flow": true
+  "issue_tracker": "https://github.com/muffintsi/hass-zim-slupsk/issues",
+  "requirements": [],
+  "version": "1.2.1"
 }

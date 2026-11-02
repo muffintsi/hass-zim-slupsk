@@ -8,7 +8,7 @@ Pozwala na obsługę w Home Assistant rozkładu jazdy komunikacji miejskiej mias
 - automatyczna aktualizacja pliku danych z serwera ZIM Słupsk (wykrywanie zmiany na serwerze)
 - praca na lokalnej wersji pliku
 - sensor rozkładu jazdy linii autobusowej na wybranym przystanku
-- sensor typu kalendarz z agenda odjazdow na tydzien w przód
+- kalendarz odjazdów z konfigurowalną liczbą dni
 - konfiguracja z GUI Home Assistant po instalacji komponentu ręcznie lub poprzez HACS
 
 Integration with ZIM Słupsk. The institution responsible for organizing public transportation and timetables in the city of Słupsk.
@@ -19,6 +19,13 @@ It allows Home Assistant to manage the public transport timetable for Słupsk.
  - Automatic update of the data file from the ZIM Słupsk server (detecting changes on the server)
  - Operation using a local version of the file
  - Sensor for the bus line timetable at a selected stop
- - Calendar-type sensor displaying the departure schedule for the week ahead
+ - Departure calendar with a configurable number of days
  - Configuration via the Home Assistant GUI after installing the component manually or through HACS
 
+
+## Ustawienia kalendarza
+
+W opcjach integracji ustaw „Liczba dni w kalendarzu”: od 1 do 60, domyślnie 7.
+Dni liczone są od dzisiaj w strefie przewoźnika. Zmiana zapisuje się automatycznie
+z zachowaniem pozostałych ustawień. Po instalacji aktualizacji uruchom ponownie
+Home Assistant.

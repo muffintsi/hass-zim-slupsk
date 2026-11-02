@@ -1,106 +1,51 @@
-from datetime import datetime, timedelta
-import logging
-import re
+"""Bus sensors updated in one batch per configured stop."""
 
+import logging
+from datetime import datetime
+
+from homeassistant.components.sensor import SensorEntity
+from homeassistant.core import callback
+from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.util import dt as dt_util
-from homeassistant.helpers.entity import Entity
-from homeassistant.helpers.event import async_track_time_interval
-from .gtfs_parser import GTFSParser
-from .const import DOMAIN
+
+from .calendar import sanitize_name
 
 _LOGGER = logging.getLogger(__name__)
 
-def sanitize_name(name):
-    """Zamienia polskie znaki i spacje na podkreślenia dla entity_id."""
-    name = name.lower()
-    name = name.replace(" ", "_")
-    name = re.sub(r"[^\w\d_]", "", name)  # Usuwamy znaki specjalne
-    return name
 
 async def async_setup_entry(hass, entry, async_add_entities):
-    """Konfiguracja sensorów dla linii autobusowych."""
-    _LOGGER.debug("Rozpoczynanie konfiguracji sensorów...")
-
-    stop_id = entry.data["stop_id"]
-    parser = hass.data[DOMAIN]
-
-    _LOGGER.debug(f"Stop ID: {stop_id}")
-
-    # Pobierz dane o przystanku z parsera
-    stop_data = parser.data["stops"].get(stop_id, {})
-    stop_name = stop_data.get("stop_name", "Nieznany")
-    stop_code = stop_data.get("stop_code", "")
-    stop_code_fragment = stop_code.split("/")[-1] if "/" in stop_code else stop_code
-
+    coordinator = entry.runtime_data
+    parser = coordinator.store.parser
+    stop = parser.get_stops()[coordinator.stop_id]
+    name = stop.get("stop_name", "Nieznany")
+    code = stop.get("stop_code", "")
+    full_name = f"{name} {code.split('/')[-1]}"
+    full_id = sanitize_name(full_name)
     try:
-        stop_lat = float(stop_data.get("stop_lat", 0.0))
-        stop_lon = float(stop_data.get("stop_lon", 0.0))
-    except ValueError:
-        _LOGGER.error(f"Niepoprawny format współrzędnych dla przystanku {stop_id}")
-        stop_lat = 0.0
-        stop_lon = 0.0
+        lat, lon = float(stop.get("stop_lat") or 0), float(stop.get("stop_lon") or 0)
+    except (TypeError, ValueError):
+        lat = lon = 0.0
+    lines = await hass.async_add_executor_job(parser.get_lines, coordinator.stop_id)
+    async_add_entities(
+        [
+            BusSensor(
+                coordinator,
+                full_name,
+                full_id,
+                line,
+                entry.entry_id,
+                f"sensor.linia_{line}_{full_id}",
+                lat,
+                lon,
+                name,
+                code,
+            )
+            for line in lines
+        ]
+    )
 
-    # Pełna nazwa przystanku
-    stop_full_name = f"{stop_name} {stop_code_fragment}"
-    stop_full_id = sanitize_name(stop_full_name)
 
-    # Pobierz odjazdy dla przystanku
-    departures_by_line = parser.get_next_departures(stop_id)
-    if not departures_by_line:
-        _LOGGER.warning(f"⚠️ Brak odjazdów (dla wszystkich linii) na przystanku {stop_full_name}.")
-        return
-
-    sensors = []
-    for line, dep_list in departures_by_line.items():
-        # Tworzymy 1 sensor per linia
-        entity_id = f"sensor.linia_{line}_{stop_full_id}"
-        # Przekazujemy dep_list do konstruktora
-        sensor = BusSensor(
-            parser,
-            stop_full_name,
-            stop_full_id,
-            line,
-            entry.entry_id,
-            entity_id,
-            stop_lat,
-            stop_lon,
-            stop_name,
-            stop_code
-        )
-        sensors.append(sensor)
-
-    if not sensors:
-        _LOGGER.warning(f"⚠️ Nie utworzono sensorów – departures_by_line={departures_by_line}")
-        return
-
-    _LOGGER.info(f"✅ Utworzono {len(sensors)} sensorów dla przystanku {stop_full_name}: {[s.name for s in sensors]}")
-    async_add_entities(sensors, True)
-
-    async def update_sensors(_):
-        _LOGGER.info(f"🔄 Odświeżanie sensorów dla przystanku {stop_full_name}")
-        updated = parser.get_next_departures(stop_id)
-        if not updated:
-            _LOGGER.warning(f"⚠️ Brak nowych odjazdów (dla wszystkich linii) dla {stop_full_name}.")
-            return
-
-        # Dla każdej encji pobieramy nową listę kursów TEJ SAMEJ linii
-        for sensor in sensors:
-            if sensor.hass is None:
-                _LOGGER.warning(f"⚠️ Sensor {sensor.name} nie jest jeszcze zarejestrowany.")
-                continue
-
-            line = sensor.line
-            new_dep_list = updated.get(line, [])
-            sensor.update_departures(new_dep_list)
-            sensor.async_write_ha_state()
-
-    # Ustawienie harmonogramu odświeżania sensorów co minutę
-    async_track_time_interval(hass, update_sensors, timedelta(minutes=1))
-
-    # **Początkowa aktualizacja sensorów**
-    await update_sensors(None)
-
-class BusSensor(Entity):
+class BusSensor(CoordinatorEntity, SensorEntity):
     """
     Sensor reprezentujący konkretną linię na danym przystanku.
     Stan -> najbliższy kurs
@@ -111,7 +56,7 @@ class BusSensor(Entity):
 
     def __init__(
         self,
-        parser: GTFSParser,
+        coordinator,
         stop_full_name: str,
         stop_full_id: str,
         line: str,
@@ -120,10 +65,11 @@ class BusSensor(Entity):
         stop_lat: float,
         stop_lon: float,
         stop_name: str,
-        stop_code: str
+        stop_code: str,
     ):
         """Initialize the sensor."""
-        self._parser = parser
+        super().__init__(coordinator)
+        self._parser = coordinator.store.parser
         self._stop_full_name = stop_full_name
         self._stop_full_id = stop_full_id
         self._line = line
@@ -143,7 +89,7 @@ class BusSensor(Entity):
         self._direction_first = None
         self._direction_second = None
 
-        self.update_departures([])  # Initialize with empty list
+        self.update_departures((coordinator.data or {}).get("departures", {}).get(line, []))
 
     @property
     def line(self):
@@ -157,7 +103,7 @@ class BusSensor(Entity):
         [1] -> nextbustime/nextbushour = kolejny
         """
         if not dep_list:
-            #_LOGGER.warning(f"⚠️ Linia {self._line} nie ma nadchodzących autobusów dla {self._stop_full_name}")
+            # _LOGGER.warning(f"⚠️ Linia {self._line} nie ma nadchodzących autobusów dla {self._stop_full_name}")
             self._state = None
             self._bushour = None
             self._nextbustime = None
@@ -191,15 +137,17 @@ class BusSensor(Entity):
             self._nextbushour = None
             self._direction_second = None
 
-        _LOGGER.info(
+        _LOGGER.debug(
             f"🚍 Sensor {self.name} (linia {self._line}) -> stan={self._state}, next={self._nextbustime}"
         )
         _LOGGER.debug(f"Departures for sensor {self.name}: {dep_list}")
 
-    async def async_update(self):
-        """Fetch new state data for the sensor."""
-        # Aktualizacja zostanie wykonana przez update_sensors w async_setup_entry
-        pass
+    @callback
+    def _handle_coordinator_update(self):
+        self.update_departures(
+            (self.coordinator.data or {}).get("departures", {}).get(self._line, [])
+        )
+        super()._handle_coordinator_update()
 
     @property
     def name(self):
@@ -216,9 +164,9 @@ class BusSensor(Entity):
         return "mdi:bus"
 
     @property
-    def state(self):
+    def native_value(self):
         """Najbliższy kurs w strefie lokalnej (ISO format)."""
-        return self._state
+        return datetime.fromisoformat(self._state) if self._state else None
 
     @property
     def device_class(self):
@@ -239,5 +187,5 @@ class BusSensor(Entity):
             "latitude": self._stop_lat,
             "longitude": self._stop_lon,
             "stop_name": self._stop_name,
-            "stop_code": self._stop_code
+            "stop_code": self._stop_code,
         }

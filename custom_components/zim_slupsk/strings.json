@@ -3,30 +3,60 @@
   "config": {
     "step": {
       "user": {
-        "title": "Zarząd Infrastruktury Miejskiej w Słupsku",
-        "description": "Select the stop you want to track",
-		"data": {
-          "stop_id": "stop"
+        "title": "ZIM Słupsk",
+        "description": "Select a stop.",
+        "data": {
+          "stop_id": "Stop"
+        }
+      },
+      "reconfigure": {
+        "title": "ZIM Słupsk",
+        "description": "Select a stop.",
+        "data": {
+          "stop_id": "Stop"
         }
       }
     },
     "error": {
-      "stops_data_unavailable": "No stops available to choose from",
-      "error_downloading_gtfs": "Error downloading GTFS data",
-      "error_loading_gtfs": "Error loading GTFS data"
+      "cannot_connect": "Cannot load GTFS data. Try again.",
+      "invalid_stop": "Select a stop from the list.",
+      "already_configured": "This stop is already configured.",
+      "stops_data_unavailable": "No stops available.",
+      "error_downloading_gtfs": "Error downloading GTFS.",
+      "error_loading_gtfs": "Error reading GTFS."
+    },
+    "abort": {
+      "cannot_connect": "Cannot load GTFS data. Try again.",
+      "invalid_stop": "Select a stop from the list.",
+      "already_configured": "This stop is already configured.",
+      "stops_data_unavailable": "No stops available.",
+      "error_downloading_gtfs": "Error downloading GTFS.",
+      "error_loading_gtfs": "Error reading GTFS.",
+      "reconfigure_successful": "Configuration saved."
     }
   },
   "options": {
     "step": {
       "init": {
-        "title": "ZIM Slupsk Options",
-        "description": "Set additional options for the ZIM Slupsk integration"
+        "title": "ZIM Słupsk",
+        "description": "Select a stop.",
+        "data": {
+          "stop_id": "Stop",
+          "calendar_days": "Calendar days"
+        },
+        "data_description": {
+          "calendar_days": "1–60 days starting today in the agency timezone. Default: 7. Does not change GTFS download frequency or departure sensors."
+        }
       }
-    }
-  },
-  "system_health": {
-    "info": {
-      "integration_version": "Integration version"
+    },
+    "error": {
+      "cannot_connect": "Cannot load GTFS data. Try again.",
+      "invalid_stop": "Select a stop from the list.",
+      "already_configured": "This stop is already configured.",
+      "stops_data_unavailable": "No stops available.",
+      "error_downloading_gtfs": "Error downloading GTFS.",
+      "error_loading_gtfs": "Error reading GTFS.",
+      "invalid_calendar_days": "Enter a whole number of days from 1 to 60."
     }
   }
 }
